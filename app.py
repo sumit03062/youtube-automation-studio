@@ -379,15 +379,54 @@ with tab_clip:
                     st.warning(f"⏱️ Selected Duration: **{clip_dur:.1f}s** (Note: YouTube Shorts max is 60s)")
 
             else:
-                st.info("ClipsAI automatically analyzes transcripts to identify stand-alone viral moments.")
-                if not CLIPS_AI_AVAILABLE:
-                    st.warning(
-                        "ClipsAI heavy ML dependencies (PyTorch / WhisperX) are not yet loaded into Python 3.13. "
-                        "You can use the **Interactive Timeline** mode right now with zero extra setup!"
-                    )
-                hf_token = st.text_input("Hugging Face Pyannote Token (Optional for Speaker Tracking)", type="password")
+                st.info("🤖 **ClipsAI** automatically transcribes your audio and uses sentence embeddings to identify stand-alone viral highlights.")
+                
+                ai_col1, ai_col2 = st.columns([1, 1])
+                with ai_col1:
+                    whisper_model = st.selectbox("Whisper Model", ["tiny (Fastest)", "base (Balanced)", "small (High Accuracy)"])
+                    model_key = whisper_model.split()[0]
+                with ai_col2:
+                    clip_limits = st.slider("Target Clip Length (Seconds)", 10, 90, (15, 60))
+
+                if st.button("🔍 Run AI Highlight Detection", type="secondary"):
+                    with st.spinner("Step 1/2: Transcribing audio with WhisperX (word-level alignment)..."):
+                        try:
+                            transcriber = Transcriber(model_size=model_key, device="cpu")
+                            transcription = transcriber.transcribe(audio_file_path=selected_video)
+                            st.session_state['transcription'] = transcription
+                            st.success("Transcription complete!")
+                        except Exception as e:
+                            st.error(f"Transcription error: {e}")
+
+                    if 'transcription' in st.session_state:
+                        with st.spinner("Step 2/2: Detecting viral clip boundaries with ClipFinder..."):
+                            try:
+                                clip_finder = ClipFinder(
+                                    min_clip_duration=clip_limits[0],
+                                    max_clip_duration=clip_limits[1]
+                                )
+                                detected = clip_finder.find_clips(transcription=st.session_state['transcription'])
+                                st.session_state['detected_clips'] = detected
+                                st.success(f"Found {len(detected)} engaging clip segments!")
+                            except Exception as e:
+                                st.error(f"ClipFinder error: {e}")
+
                 start_s = 0.0
                 end_s = min(60.0, float(duration))
+
+                if 'detected_clips' in st.session_state and st.session_state['detected_clips']:
+                    clips_list = st.session_state['detected_clips']
+                    clip_labels = [
+                        f"Clip {i+1}: {format_seconds(c.start_time)} ➔ {format_seconds(c.end_time)} ({c.end_time - c.start_time:.1f}s)"
+                        for i, c in enumerate(clips_list)
+                    ]
+                    chosen_clip_label = st.selectbox("Select Detected Highlight to Export", clip_labels)
+                    chosen_idx = clip_labels.index(chosen_clip_label)
+                    chosen_clip = clips_list[chosen_idx]
+                    start_s = float(chosen_clip.start_time)
+                    end_s = float(chosen_clip.end_time)
+                    
+                    st.success(f"🎯 Selected: {format_seconds(start_s)} to {format_seconds(end_s)} ({end_s - start_s:.1f} seconds)")
 
             st.markdown("#### Aspect Ratio & Styling")
             aspect_choice = st.selectbox(
