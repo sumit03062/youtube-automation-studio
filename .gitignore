@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Media Dirs (Keep directory structure with .gitkeep)
+downloads/*
+!downloads/.gitkeep
+exports/*
+!exports/.gitkeep
+
+# Environment & Credentials
+.env
+.env.local
+*.pem
+*.key
+
+# Node / Web build artifacts
+node_modules/
+.next/
+dist/
+.turbo/
+
+# OS specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.log
