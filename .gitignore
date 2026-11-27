@@ -27,3 +27,8 @@ ehthumbs.db
 Desktop.ini
 .DS_Store
 *.log
+
+# Python environment and package cache
+.venv/
+.uv-cache/
+.model-cache/

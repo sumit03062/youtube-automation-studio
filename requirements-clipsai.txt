@@ -1,0 +1,14 @@
+# Optional legacy ClipsAI dependencies; not needed by the Studio.
+streamlit
+torch>=2.8.0
+torchaudio>=2.8.0
+whisperx>=3.8.0
+sentence-transformers
+scenedetect
+mediapipe
+facenet-pytorch
+python-magic-bin
+pynvml
+opencv-python
+pillow
+requests

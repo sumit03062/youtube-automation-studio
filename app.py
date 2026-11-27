@@ -3,11 +3,12 @@ import sys
 import subprocess
 import json
 import re
+from uuid import uuid4
 from pathlib import Path
 import streamlit as st
 
 # Setup Paths
-BASE_DIR = Path(r"D:\youtube")
+BASE_DIR = Path(__file__).resolve().parent
 YTDLP_DIR = BASE_DIR / "yt-dlp"
 CLIPSAI_DIR = BASE_DIR / "clipsai"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
@@ -28,20 +29,35 @@ except Exception as e:
     YTDLP_AVAILABLE = False
     YTDLP_ERROR = str(e)
 
-# Attempt importing clipsai
-CLIPS_AI_AVAILABLE = False
-CLIPS_AI_ERROR = ""
-try:
-    if str(CLIPSAI_DIR) not in sys.path:
-        sys.path.insert(0, str(CLIPSAI_DIR))
-    from clipsai import ClipFinder, Transcriber
-    CLIPS_AI_AVAILABLE = True
-except Exception as e:
-    CLIPS_AI_ERROR = str(e)
+from whisper_engine import transcribe, suggest_clips
 
-FFMPEG_EXE = r"C:\ffmpeg\bin\ffmpeg.exe"
-if not os.path.exists(FFMPEG_EXE):
-    FFMPEG_EXE = "ffmpeg"  # fallback to PATH
+WHISPER_AVAILABLE = False
+WHISPER_ERROR = ""
+try:
+    import faster_whisper
+    WHISPER_AVAILABLE = True
+except Exception as exc:
+    WHISPER_ERROR = str(exc)
+
+import shutil
+
+def find_binary(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if local_app_data:
+        winget_dir = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+        if winget_dir.exists():
+            matches = list(winget_dir.glob(f"**/{name}.exe"))
+            if matches:
+                return str(matches[0])
+    standard = Path(r"C:\ffmpeg\bin") / f"{name}.exe"
+    if standard.exists():
+        return str(standard)
+    return name
+
+FFMPEG_EXE = find_binary("ffmpeg")
 
 
 def get_video_info(url: str):
@@ -96,9 +112,7 @@ def download_youtube_video(url: str, output_path: Path, quality: str = "best"):
 
 def get_video_duration(file_path: str) -> float:
     """Get video duration using ffprobe or ffmpeg."""
-    ffprobe_exe = r"C:\ffmpeg\bin\ffprobe.exe"
-    if not os.path.exists(ffprobe_exe):
-        ffprobe_exe = "ffprobe"
+    ffprobe_exe = find_binary("ffprobe")
 
     cmd = [
         ffprobe_exe,
@@ -236,7 +250,7 @@ st.markdown('<div class="main-title">🎬 YouTube Shorts AI Studio</div>', unsaf
 st.markdown(
     '<div class="sub-title">'
     '<span class="badge badge-ytdlp">yt-dlp</span> Download Video &nbsp;➔&nbsp; '
-    '<span class="badge badge-clipsai">ClipsAI</span> Detect & Reframe 9:16 &nbsp;➔&nbsp; '
+    '<span class="badge badge-clipsai">Whisper</span> Transcribe & Reframe 9:16 &nbsp;➔&nbsp; '
     '<span class="badge badge-postiz">Postiz</span> Schedule & Multi-Post'
     '</div>',
     unsafe_allow_html=True
@@ -248,14 +262,16 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ Studio Status")
     st.markdown(f"**yt-dlp:** {'✅ Ready' if YTDLP_AVAILABLE else '❌ Error'}")
-    st.markdown(f"**FFmpeg:** {'✅ Ready' if os.path.exists(FFMPEG_EXE) else '⚠️ Using PATH'}")
-    st.markdown(f"**ClipsAI Engine:** {'✅ Core Available' if CLIPS_AI_AVAILABLE else 'ℹ️ Needs Torch/WhisperX'}")
+    st.markdown(f"**FFmpeg:** {'✅ Ready' if os.path.exists(FFMPEG_EXE) or shutil.which(FFMPEG_EXE) else '⚠️ Not Found'}")
+    st.markdown(f"**Faster-Whisper:** {'✅ Ready' if WHISPER_AVAILABLE else '⚠️ Installation needed'}")
+    if not WHISPER_AVAILABLE:
+        st.caption(WHISPER_ERROR)
 
     st.divider()
     st.header("🚀 Postiz Publisher")
     st.markdown("Open your local social media scheduling hub:")
     st.markdown("[👉 Open Postiz Web UI (localhost:4007)](http://localhost:4007)")
-    st.caption("Tip: Run `docker compose up -d` in `D:\\youtube\\postiz-app` to start Postiz.")
+    st.caption(f"Tip: Run `docker compose up -d` in `{BASE_DIR / 'postiz-app'}` to start Postiz.")
 
     st.divider()
     st.header("📂 Folders")
@@ -268,7 +284,7 @@ with st.sidebar:
 # ==========================================
 tab_download, tab_clip, tab_publish = st.tabs([
     "1️⃣ Download Video (yt-dlp)",
-    "2️⃣ Create & Reframe Short (ClipsAI / FFmpeg)",
+    "2️⃣ Create & Reframe Short (Whisper / FFmpeg)",
     "3️⃣ Schedule & Multi-Post (Postiz)"
 ])
 
@@ -342,7 +358,7 @@ with tab_clip:
         chosen_name = st.selectbox("Select Video File to Clip", video_names, index=default_index)
         selected_video = str(DOWNLOADS_DIR / chosen_name)
     else:
-        st.warning("No downloaded videos found in `D:\\youtube\\downloads`. Download one in Tab 1 or drop a video file into that folder.")
+        st.warning(f"No downloaded videos found in `{DOWNLOADS_DIR}`. Download one in Tab 1 or drop a video file into that folder.")
 
     if selected_video and os.path.exists(selected_video):
         duration = get_video_duration(selected_video)
@@ -356,8 +372,17 @@ with tab_clip:
         with col_controls:
             st.markdown("#### Trimming & Formatting Settings")
 
-            # Dual Mode: Auto AI Highlight vs Interactive Timeline
-            mode = st.radio("Highlight Method", ["Interactive Timeline (Instant)", "ClipsAI Engine (Auto-Find)"], horizontal=True)
+            source_stat = Path(selected_video).stat()
+            batch_source = (selected_video, source_stat.st_size, source_stat.st_mtime_ns)
+            if st.session_state.get("batch_source") != batch_source:
+                st.session_state["batch_source"] = batch_source
+                st.session_state["manual_clips"] = []
+                st.session_state.pop("batch_results", None)
+                st.session_state.pop("manual_selection", None)
+            batch_clips = []
+
+            # Choose manual timestamps or transcript-based clips
+            mode = st.radio("Highlight Method", ["Interactive Timeline (Instant)", "Whisper (Speech-Based Clips)"], horizontal=True)
 
             if mode == "Interactive Timeline (Instant)":
                 st.caption(f"Total Video Length: **{format_seconds(duration)}** ({duration:.1f}s)")
@@ -378,55 +403,73 @@ with tab_clip:
                 else:
                     st.warning(f"⏱️ Selected Duration: **{clip_dur:.1f}s** (Note: YouTube Shorts max is 60s)")
 
+                if st.button("Add This Range to Batch", disabled=end_s <= start_s):
+                    queue = st.session_state["manual_clips"]
+                    if (start_s, end_s) not in queue:
+                        queue.append((start_s, end_s))
+                        st.session_state["manual_selection"] = list(range(len(queue)))
+                queue = st.session_state["manual_clips"]
+                selected_ranges = st.multiselect("Select Manual Clips to Render", range(len(queue)),
+                    key="manual_selection",
+                    format_func=lambda i: f"Clip {i+1}: {format_seconds(queue[i][0])} to {format_seconds(queue[i][1])}")
+                batch_clips = [(i+1, *queue[i]) for i in selected_ranges]
+                st.caption("Choose each range on the timeline and add it to the batch. Select the clips you want, then render them together below.")
+
             else:
-                st.info("🤖 **ClipsAI** automatically transcribes your audio and uses sentence embeddings to identify stand-alone viral highlights.")
-                
-                ai_col1, ai_col2 = st.columns([1, 1])
-                with ai_col1:
-                    whisper_model = st.selectbox("Whisper Model", ["tiny (Fastest)", "base (Balanced)", "small (High Accuracy)"])
-                    model_key = whisper_model.split()[0]
-                with ai_col2:
-                    clip_limits = st.slider("Target Clip Length (Seconds)", 10, 90, (15, 60))
+                st.info("Whisper transcribes speech and suggests chronological clips using speech boundaries. Suggestions are not ranked by engagement.")
+                model_key = st.selectbox("Whisper Model", ["tiny", "base", "small"], index=2)
+                device_label = st.selectbox("Processing Device", ["Auto (GPU with CPU fallback)", "CPU", "NVIDIA GPU"])
+                device = {"Auto (GPU with CPU fallback)": "auto", "CPU": "cpu", "NVIDIA GPU": "cuda"}[device_label]
+                language_label = st.selectbox("Speech Language", ["Auto-detect", "Hindi", "English"])
+                language = {"Auto-detect": None, "Hindi": "hi", "English": "en"}[language_label]
+                clip_limits = st.slider("Target Clip Length (Seconds)", 10, 90, (15, 60))
+                st.caption("The first run downloads the model. Small is recommended for your GPU; base is faster on CPU.")
+                source = Path(selected_video).stat()
+                request_key = (selected_video, source.st_size, source.st_mtime_ns, model_key, device, language)
+                if st.session_state.get("whisper_key") != request_key:
+                    st.session_state.pop("whisper_result", None)
+                    st.session_state.pop("whisper_key", None)
+                if not WHISPER_AVAILABLE:
+                    st.warning("Install dependencies using: python -m pip install -r requirements.txt")
+                if st.button("🔍 Transcribe & Find Clips", disabled=not WHISPER_AVAILABLE):
+                    st.session_state.pop("whisper_result", None)
+                    st.session_state.pop("whisper_key", None)
+                    progress_bar = st.progress(0.0)
+                    try:
+                        with st.spinner("Transcribing speech with Faster-Whisper..."):
+                            result = transcribe(selected_video, model_key, device, language, progress_bar.progress)
+                        st.session_state["whisper_result"] = result
+                        st.session_state["whisper_key"] = request_key
+                    except Exception as exc:
+                        st.error(f"Transcription failed: {exc}. Try CPU mode if CUDA libraries are unavailable.")
+                    finally:
+                        progress_bar.empty()
 
-                if st.button("🔍 Run AI Highlight Detection", type="secondary"):
-                    with st.spinner("Step 1/2: Transcribing audio with WhisperX (word-level alignment)..."):
-                        try:
-                            transcriber = Transcriber(model_size=model_key, device="cpu")
-                            transcription = transcriber.transcribe(audio_file_path=selected_video)
-                            st.session_state['transcription'] = transcription
-                            st.success("Transcription complete!")
-                        except Exception as e:
-                            st.error(f"Transcription error: {e}")
-
-                    if 'transcription' in st.session_state:
-                        with st.spinner("Step 2/2: Detecting viral clip boundaries with ClipFinder..."):
-                            try:
-                                clip_finder = ClipFinder(
-                                    min_clip_duration=clip_limits[0],
-                                    max_clip_duration=clip_limits[1]
-                                )
-                                detected = clip_finder.find_clips(transcription=st.session_state['transcription'])
-                                st.session_state['detected_clips'] = detected
-                                st.success(f"Found {len(detected)} engaging clip segments!")
-                            except Exception as e:
-                                st.error(f"ClipFinder error: {e}")
-
-                start_s = 0.0
-                end_s = min(60.0, float(duration))
-
-                if 'detected_clips' in st.session_state and st.session_state['detected_clips']:
-                    clips_list = st.session_state['detected_clips']
-                    clip_labels = [
-                        f"Clip {i+1}: {format_seconds(c.start_time)} ➔ {format_seconds(c.end_time)} ({c.end_time - c.start_time:.1f}s)"
-                        for i, c in enumerate(clips_list)
-                    ]
-                    chosen_clip_label = st.selectbox("Select Detected Highlight to Export", clip_labels)
-                    chosen_idx = clip_labels.index(chosen_clip_label)
-                    chosen_clip = clips_list[chosen_idx]
-                    start_s = float(chosen_clip.start_time)
-                    end_s = float(chosen_clip.end_time)
-                    
-                    st.success(f"🎯 Selected: {format_seconds(start_s)} to {format_seconds(end_s)} ({end_s - start_s:.1f} seconds)")
+                start_s, end_s = 0.0, min(60.0, float(duration))
+                result = st.session_state.get("whisper_result")
+                if result:
+                    if result.get("warning"):
+                        st.warning(result["warning"])
+                    st.caption(f"Language: {result['language']} | Processing device: {result['device']}")
+                    clips_list = suggest_clips(result["segments"], *clip_limits, duration) if duration > 0 else []
+                    if clips_list:
+                        selection_signature = (request_key, tuple((c.start_time, c.end_time) for c in clips_list))
+                        if st.session_state.get("speech_selection_signature") != selection_signature:
+                            st.session_state.pop("speech_selection", None)
+                            st.session_state["speech_selection_signature"] = selection_signature
+                        chosen_indices = st.multiselect("Select Speech Clips to Render", range(len(clips_list)),
+                            key="speech_selection",
+                            format_func=lambda i: f"Clip {i+1}: {format_seconds(clips_list[i].start_time)} to {format_seconds(clips_list[i].end_time)}")
+                        batch_clips = [(i+1, clips_list[i].start_time, clips_list[i].end_time) for i in chosen_indices]
+                        for i in chosen_indices:
+                            with st.expander(f"Clip {i+1} transcript"):
+                                st.write(clips_list[i].text)
+                    else:
+                        st.warning("No speech clips fit these limits. Adjust the limits or use the interactive timeline.")
+                    with st.expander("Transcript with timestamps"):
+                        st.dataframe([{k: row[k] for k in ("start", "end", "text")} for row in result["segments"]])
+                    st.download_button("Download transcript JSON", json.dumps(result, ensure_ascii=False, indent=2),
+                                       file_name=Path(selected_video).stem + ".transcript.json", mime="application/json")
 
             st.markdown("#### Aspect Ratio & Styling")
             aspect_choice = st.selectbox(
@@ -446,21 +489,42 @@ with tab_clip:
 
             clip_name = st.text_input("Short Clip Title / Filename", value="short_clip_1")
 
-            if st.button("✨ Render & Export Short Clip", type="primary"):
-                output_file = str(EXPORTS_DIR / f"{clip_name}_{aspect_code}.mp4")
-                with st.spinner("Rendering clip with FFmpeg high-speed encoder..."):
-                    try:
-                        rendered_path = render_clip(
-                            input_video=selected_video,
-                            start_sec=start_s,
-                            end_sec=end_s,
-                            output_path=output_file,
-                            aspect_mode=aspect_code
-                        )
-                        st.success(f"Rendered Short successfully: `{os.path.basename(rendered_path)}`")
-                        st.session_state['last_rendered'] = rendered_path
-                    except Exception as err:
-                        st.error(f"Render failed: {err}")
+            safe_name = re.sub(r'[^\w-]+', '_', clip_name).strip('_')[:80] or "short"
+            if mode == "Interactive Timeline (Instant)":
+                if st.button("✨ Render & Export Short Clip", disabled=duration <= 0 or end_s <= start_s):
+                    output_file = str(EXPORTS_DIR / f"{safe_name}_{uuid4().hex[:10]}_{aspect_code}.mp4")
+                    with st.spinner("Rendering clip..."):
+                        try:
+                            st.session_state['last_rendered'] = render_clip(selected_video, start_s, end_s, output_file, aspect_code)
+                            st.success("Clip exported successfully.")
+                        except Exception as err:
+                            st.error(f"Render failed: {err}")
+
+            st.caption(f"{len(batch_clips)} clips selected for batch export. The framing above applies to all selected clips.")
+            if st.button("🎬 Render Selected Clips", type="primary", disabled=not batch_clips or duration <= 0):
+                batch_id = uuid4().hex[:10]
+                results = []
+                progress = st.progress(0.0)
+                for position, (number, clip_start, clip_end) in enumerate(batch_clips):
+                    output_file = str(EXPORTS_DIR / f"{safe_name}_{batch_id}_clip_{number:02d}_{aspect_code}.mp4")
+                    with st.spinner(f"Rendering clip {position+1} of {len(batch_clips)}..."):
+                        try:
+                            if not 0 <= clip_start < clip_end <= duration:
+                                raise ValueError("Clip timestamps fall outside the source video")
+                            path = render_clip(selected_video, clip_start, clip_end, output_file, aspect_code)
+                            results.append({"clip": number, "file": path, "status": "Exported"})
+                            st.session_state['last_rendered'] = path
+                        except Exception as err:
+                            Path(output_file).unlink(missing_ok=True)
+                            results.append({"clip": number, "file": "", "status": f"Failed: {err}"})
+                    progress.progress((position+1)/len(batch_clips))
+                st.session_state["batch_results"] = results
+                progress.empty()
+            if st.session_state.get("batch_results"):
+                results = st.session_state["batch_results"]
+                completed = sum(r["status"] == "Exported" for r in results)
+                st.info(f"Last batch: {completed}/{len(results)} clips exported to {EXPORTS_DIR}")
+                st.dataframe(results, hide_index=True)
 
         # Show preview of rendered short
         if 'last_rendered' in st.session_state and os.path.exists(st.session_state['last_rendered']):
@@ -492,10 +556,10 @@ with tab_publish:
         st.write("Postiz runs locally in Docker containers at port `4007`.")
         
         st.markdown(
-            """
+            f"""
             ```powershell
             # Run in PowerShell to start Postiz:
-            cd D:\\youtube\\postiz-app
+            cd {BASE_DIR / 'postiz-app'}
             docker compose up -d
             ```
             """
@@ -517,4 +581,4 @@ with tab_publish:
                     st.caption(f"Path: `{ef}`")
                     st.video(str(ef))
         else:
-            st.info("No exported clips found in `D:\\youtube\\exports`. Render a clip in Tab 2!")
+            st.info(f"No exported clips found in `{EXPORTS_DIR}`. Render a clip in Tab 2!")
